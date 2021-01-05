@@ -13,7 +13,7 @@ from utils import construct_bert_input, MultiModalBertDataset, PreprocessedADARI
 from transformers import get_linear_schedule_with_warmup
 import argparse
 import datetime
-from codedbert_adaptive_loss import adaptive_loss
+from codedbert_adaptive_loss import adaptive_loss, adaptive_loss_4losses
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -43,7 +43,9 @@ class codedbert(transformers.BertPreTrainedModel):
 
         self.im_to_embedding = torch.nn.Linear(2048, 768)
         self.im_to_embedding_norm = torch.nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        
+
+        self.sentence_alignment = torch.nn.Linear(config.hidden_size, 2)
+
         self.cls = BertPreTrainingHeads(config)
         self.im_head = codedbertHead(config)
 
@@ -78,7 +80,6 @@ class codedbert(transformers.BertPreTrainedModel):
         seq_length = embeds.shape[1]
         hidden_dim = embeds.shape[2]
 
-
         outputs = self.bert(inputs_embeds=embeds, 
                             attention_mask=attention_mask,
                             return_dict=True)
@@ -88,12 +89,21 @@ class codedbert(transformers.BertPreTrainedModel):
 
         # hidden states corresponding to the text part
         text_output = sequence_output[:, :labels.shape[1], :]
+
+        # hidden states corresponding to the sentence part
+        sentence_output = sequence_output[:, labels.shape[1]:labels.shape[1]+16, :]
+
         # hidden states corresponding to the image part
-        image_output = sequence_output[:, labels.shape[1]:, :]
+        image_output = sequence_output[:, labels.shape[1]+16:, :]
 
         # Predict the masked text tokens and alignment scores (whether image, text match)
         prediction_scores, alignment_scores = self.cls(text_output, pooler_output)
         im_scores = self.im_head(image_output)
+
+        # Predict sentence alignemnt
+        sentence_alignment_pred = self.sentence_alignment(sentence_output)
+        pred_scores_sent_aligned = sentence_alignment_pred[is_paired.view(-1)]
+
         # We only want to compute masked losses w.r.t. aligned samples
         pred_scores_aligned = prediction_scores[is_paired.view(-1)]
         labels_aligned = labels[is_paired.view(-1)]
@@ -104,7 +114,6 @@ class codedbert(transformers.BertPreTrainedModel):
             masked_lm_loss = loss_fct(pred_scores_aligned.view(-1, self.config.vocab_size), labels_aligned.view(-1))
         else:
             masked_lm_loss = torch.tensor(0.0).to(self.device)
-
 
         # Compute masked patch reconstruction loss
         # Only look at aligned images
@@ -119,21 +128,22 @@ class codedbert(transformers.BertPreTrainedModel):
         else:
             masked_patch_loss = torch.tensor(0.0).to(self.device)
         
-
-        # Compute alignment loss
+        # Compute alignment loss for text
         loss_fct = torch.nn.CrossEntropyLoss()
-        alignment_loss = loss_fct(alignment_scores.view(-1, 2), is_paired.long().view(-1))
-            
+        alignment_loss_text = loss_fct(alignment_scores.view(-1, 2), is_paired.long().view(-1))
+
+        # Compute alignment loss for sentence
+        alignment_loss_sent = loss_fct(pred_scores_sent_aligned.view(-1, 2), is_paired.long().view(-1))
 
         return {
             "raw_outputs": outputs, 
             "masked_lm_loss": masked_lm_loss,
             "masked_patch_loss": masked_patch_loss,
-            "alignment_loss": alignment_loss
+            "alignment_loss_text": alignment_loss_text,
+            "alignment_loss_sent": alignment_loss_sent,
             }
 
-
-def train(fashion_bert, dataset, params, device, random_patches=False):
+def train(coded_bert, dataset, params, device, random_patches=False):
     torch.manual_seed(0)
     train_size = int(len(dataset) * .8)
     test_size = len(dataset) - train_size
@@ -144,10 +154,10 @@ def train(fashion_bert, dataset, params, device, random_patches=False):
         shuffle=True,
         )
 
-    fashion_bert.to(device)
-    fashion_bert.train()
+    coded_bert.to(device)
+    coded_bert.train()
     opt = transformers.Adafactor(
-        fashion_bert.parameters(), 
+        coded_bert.parameters(), 
         lr=params.lr, 
         beta1=params.beta1, 
         weight_decay=params.weight_decay,
@@ -160,8 +170,9 @@ def train(fashion_bert, dataset, params, device, random_patches=False):
     scheduler = get_linear_schedule_with_warmup(opt, params.num_warmup_steps, params.num_epochs * len(dataloader))
 
     for ep in range(params.num_epochs):
-        avg_losses = {"masked_lm_loss": [], "masked_patch_loss": [], "alignment_loss": [], "total": []}
-        for patches, input_ids, is_paired, attention_mask in dataloader:
+        avg_losses = {"masked_lm_loss": [], "masked_patch_loss": [], "alignment_loss_text": [], "alignment_loss_sent": [], "total": []}
+        for patches, input_ids, is_paired, attention_mask, sents_embeds in dataloader:
+            # sents_embeds = [batch, 16, 768]
             opt.zero_grad()
 
             # mask image patches with prob 10%
@@ -187,23 +198,19 @@ def train(fashion_bert, dataset, params, device, random_patches=False):
             input_ids[token_mask >= 0.15] = -100
             input_ids[attention_mask == 0] = -100
 
-            embeds = construct_bert_input(masked_patches, masked_input_ids, fashion_bert, device=device, random_patches=random_patches)
+            embeds = construct_bert_input(masked_patches, masked_input_ids, coded_bert, sentences=sents_embeds, device=device, random_patches=random_patches)
             # pad attention mask with 1s so model pays attention to the image parts
-            attention_mask = F.pad(attention_mask, (0, embeds.shape[1] - input_ids.shape[1]), value = 1)
+            attention_mask = F.pad(attention_mask, (0, embeds.shape[1] - input_ids.shape[1]), value = 1) # still works with sentences since we are using 1s for sent and imgs
 
-
-            outputs = fashion_bert(
+            outputs = coded_bert(
                 embeds=embeds.to(device), 
                 attention_mask=attention_mask.to(device), 
                 labels=input_ids.to(device), 
                 unmasked_patch_features=patches.to(device), 
                 is_paired=is_paired.to(device)
                 )
-
-            #loss = (1. / 3.) * outputs['masked_lm_loss'] \
-            #    + (1. / 3.) * outputs['masked_patch_loss'] \
-            #    + (1. / 3.) * outputs['alignment_loss']
-            loss = adaptive_loss(outputs)
+            
+            loss = adaptive_loss_4losses(outputs)
 
             loss.backward()
             opt.step()
@@ -241,7 +248,7 @@ if __name__ == '__main__':
 
     params = TrainParams()
 
-    fashion_bert = codedbert.from_pretrained('bert-base-uncased', return_dict=True)
+    coded_bert = codedbert.from_pretrained('bert-base-uncased', return_dict=True)
     #dataset = MultiModalBertDataset(
     #    args.path_to_images, 
     #    args.path_to_data_dict,
@@ -250,11 +257,11 @@ if __name__ == '__main__':
     dataset = PreprocessedADARI(args.path_to_dataset)
 
     try:
-        train(fashion_bert, dataset, params, device, args.random_patches)
+        train(coded_bert, dataset, params, device, args.random_patches)
     except KeyboardInterrupt:
         pass
     model_time = datetime.datetime.now().strftime("%X")
     model_name = f"codedbert_{model_time}"
     print(f"Saving trained model to directory {model_name}...")
-    fashion_bert.save_pretrained(model_name)
+    coded_bert.save_pretrained(model_name)
     save_json(f"{model_name}/train_params.json", params.__dict__)

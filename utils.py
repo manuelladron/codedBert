@@ -5,7 +5,7 @@ import PIL
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 import transformers
-from transformers import BertTokenizer
+from transformers import BertTokenizer, BertModel
 import pandas as pd 
 import pickle
 import random
@@ -21,30 +21,45 @@ def save_json(file_path, data):
     json.dump(data, out_file)
     out_file.close()
 
-def construct_bert_input(patches, input_ids, fashion_bert, device=None, random_patches=False):
+def construct_bert_input(patches, input_ids, coded_bert, sentences=None, device=None, random_patches=False):
     # patches shape: batch size, im sequence length, embedding size
     # input_ids shape: batch size, sentence length
+    # sentences shape: batch, 16 sents, 768
 
     # shape: batch size, sequence length, embedding size
-    #word_embeddings = fashion_bert.bert.embeddings(
+    #word_embeddings = coded_bert.bert.embeddings(
     #    input_ids.to(device), 
     #    token_type_ids=torch.zeros(input_ids.shape, dtype=torch.long).to(device), 
     #    position_ids=torch.arange(0, input_ids.shape[1], dtype=torch.long).to(device) * torch.ones(input_ids.shape, dtype=torch.long).to(device))
-    word_embeddings = fashion_bert.bert.embeddings(input_ids.to(device))
+    word_embeddings = coded_bert.bert.embeddings(input_ids.to(device))
 
+    # For images
     if not random_patches:
         image_position_ids = torch.arange(1, patches.shape[1]+1, dtype=torch.long).view(-1, 1) * torch.ones(patches.shape[0], dtype=torch.long)
         image_position_ids = image_position_ids.T
-    image_token_type_ids = torch.ones((patches.shape[0], patches.shape[1]), dtype=torch.long)
+
+    # Get token type ids
+    if sentences != None:
+        # Token type
+        sentences_token_type_ids = torch.ones((sentences.shape[0], sentences.shape[1]), dtype=torch.long)
+        sentences_token_type_embeds = coded_bert.bert.embeddings.token_type_embeddings(sentences_token_type_ids.to(device))
+        # Position
+        sentences_position_ids = torch.arange(1, sentences.shape[1] + 1, dtype=torch.long).view(-1, 1) * torch.ones(sentences.shape[0], dtype=torch.long).T
+        sentences_position_embeds = coded_bert.bert.embeddings.position_embeddings(sentences_position_ids.to(device))
+        # Image token
+        image_token_type_ids = torch.ones((patches.shape[0], patches.shape[1]), dtype=torch.long) * 2
+    else:
+        image_token_type_ids = torch.ones((patches.shape[0], patches.shape[1]), dtype=torch.long)
 
     if not random_patches:
-        image_position_embeds = fashion_bert.bert.embeddings.position_embeddings(image_position_ids.to(device))
-    image_token_type_embeds = fashion_bert.bert.embeddings.token_type_embeddings(image_token_type_ids.to(device))
+        image_position_embeds = coded_bert.bert.embeddings.position_embeddings(image_position_ids.to(device))
+    image_token_type_embeds = coded_bert.bert.embeddings.token_type_embeddings(image_token_type_ids.to(device))
+
 
     # transforms patches into batch size, im sequence length, 768
     im_seq_len = patches.shape[1]
     patches = patches.view(-1, patches.shape[2])
-    patches = fashion_bert.im_to_embedding(patches.to(device))
+    patches = coded_bert.im_to_embedding(patches.to(device))
     # now shape batch size, im sequence length, 768
     patches = patches.view(word_embeddings.shape[0], im_seq_len, -1)
 
@@ -53,7 +68,12 @@ def construct_bert_input(patches, input_ids, fashion_bert, device=None, random_p
         image_embeddings = patches + image_position_embeds + image_token_type_embeds
     else:
         image_embeddings = patches + image_token_type_embeds
-    image_embeddings = fashion_bert.im_to_embedding_norm(image_embeddings)
+    image_embeddings = coded_bert.im_to_embedding_norm(image_embeddings)
+
+    # sentences
+    if sentences != None:
+        sentences_embeddings = sentences + sentences_position_embeds + sentences_token_type_embeds
+        return torch.cat((word_embeddings, sentences_embeddings, image_embeddings), dim=1)
 
     return torch.cat((word_embeddings, image_embeddings), dim=1)
 
@@ -101,6 +121,9 @@ class Encoder_mCNN_resnet(torch.nn.Module):
     
     
 class MultiModalBertDataset(Dataset):
+    """
+    Added sentence embeddings
+    """
     def __init__(
         self, 
         path_to_images, 
@@ -129,11 +152,55 @@ class MultiModalBertDataset(Dataset):
         self.im_encoder.to(device)
         
         self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        self.bertModel = BertModel.from_pretrained('bert-base-uncased', output_hidden_states = True)
         self.device = device
 
     def __len__(self):
         return len(self.data_dict)
+    
+    def get_sent_embeddings(self, sentences):
+        """
+        Params: sentences: variable sequence of sentences in the dataset. 
+        Outputs: embeddings of length [16, 768] # 16 from statistics. Avg num of sentences in samples
+        """
+        self.bertModel.eval()
+        inputs_ids = []
+        att_masks = []
+        
+        for i, sent in enumerate(sentences):
+            tokens = self.tokenizer(
+                        sent,
+                        max_length = 130, # from dataset statistics, avg = 128 characters per sentence
+                        truncation = True,
+                        padding = 'max_length',
+                        return_tensors = 'pt')
 
+            inputs_ids.append(tokens['input_ids'])
+            att_masks.append(tokens['attention_mask'])
+        
+        inputs_ids_torch = torch.cat(inputs_ids, dim=0)
+        att_masks_torch = torch.cat(att_masks, dim=0)
+        
+        with torch.no_grad():
+            outputs = self.bertModel(inputs_ids_torch, attention_mask = att_masks_torch)
+        
+        hidden_states = outputs[2] # list of tensors
+        hs = torch.stack(hidden_states, dim=0) # tensor [13 layers, num_sents, seq_len, hid_dim]
+        
+        # Sentence embeddings are second to last layer and average over inputs 
+        second_to_last = hs[-2, :, :, :]
+        sent_embeddings = torch.mean(second_to_last, dim=1) # [num_sents, 768]
+        
+        ## truncate or pad 
+        if sent_embeddings.shape[0] < 16:
+            num_padding = 16 - sent_embeddings.shape[0]
+            zeros = torch.zeros(num_padding, 768)
+            sent_embeddings = torch.cat((sent_embeddings, zeros), dim=0)
+        else:
+            sent_embeddings = sent_embeddings[:16, :] 
+
+        return sent_embeddings # [16, 768]
+        
     def __getitem__(self, index):
         sample = self.data_dict[index]
 
@@ -162,14 +229,18 @@ class MultiModalBertDataset(Dataset):
                     patch_positions.append((i*self.patch_size, j*self.patch_size, (i+1)*self.patch_size, (j+1)*self.patch_size))
             processed_patches = self.im_encoder(torch.stack(patches).to(self.device))
         
+        # encode sentences 
+        sent_embeddings = self.get_sent_embeddings(text[0])
+       
+        # encode words 
         tokens = self.tokenizer(
             "".join([s + ' ' for s in text[0]]),
-            max_length = 448,
+            max_length = 432, # old 448
             truncation = True,
             padding = 'max_length',
             return_tensors = 'pt')
     
-        return processed_patches, tokens['input_ids'][0], torch.tensor(is_paired), tokens['attention_mask'][0], image_name, torch.tensor(patch_positions, dtype=torch.long)
+        return processed_patches, tokens['input_ids'][0], torch.tensor(is_paired), tokens['attention_mask'][0], image_name, torch.tensor(patch_positions, dtype=torch.long), sent_embeddings
 
 
 class PreprocessedADARI(Dataset):
@@ -193,7 +264,9 @@ class PreprocessedADARI(Dataset):
             torch.tensor(sample.patches).view(sample.patches.shape[0], sample.patches.shape[1]), 
             torch.tensor(sample.input_ids),
             torch.tensor(sample.is_paired),
-            torch.tensor(sample.attention_mask)
+            torch.tensor(sample.attention_mask), 
+            # New addition for sentences
+            torch.tensor(sample.sents_embeds),
             )
  
 class EvaluationDataset(Dataset):
@@ -321,7 +394,7 @@ def mask_input_ids(
     returns:
         masked_input_ids, labels
         masked_input_ids should be fed into construct_bert_input
-        labels should be fed into fashion_bert label argument
+        labels should be fed into coded_bert label argument
     """
 
     masked_input_ids = input_ids.detach().clone()
