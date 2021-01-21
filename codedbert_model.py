@@ -7,15 +7,18 @@ from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 import transformers
 from transformers import AdamW
-from transformers import BertTokenizer, BertModel
+from transformers import BertTokenizer, BertModel, BertConfig
 from transformers.models.bert.modeling_bert import BertPreTrainingHeads
 from utils import construct_bert_input, MultiModalBertDataset, PreprocessedADARI, save_json
 from transformers import get_linear_schedule_with_warmup
 import argparse
 import datetime
 from codedbert_adaptive_loss import adaptive_loss, adaptive_loss_4losses
+# import os
+# os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print('device: ', device)
 
 class codedbertHead(torch.nn.Module):
     def __init__(self, config):
@@ -35,17 +38,28 @@ class codedbertHead(torch.nn.Module):
 
         return h.view(batch_size, seq_len, -1)
 
+    
+class codedbertSentenceHead(torch.nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.sent_cls = torch.nn.Linear(config.hidden_size, 2)
+
+    def forward(self, sent_output):
+        return self.sent_cls(sent_output)  
+    
 class codedbert(transformers.BertPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
-
+   
         self.bert = BertModel(config)
-
+    
+        self.im_type_em = torch.nn.Embedding(1, config.hidden_size)
+        self.im_position_embeddings = torch.nn.Embedding(config.max_position_embeddings, config.hidden_size)
         self.im_to_embedding = torch.nn.Linear(2048, 768)
         self.im_to_embedding_norm = torch.nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
-        self.sentence_alignment = torch.nn.Linear(config.hidden_size, 2)
-
+        #self.sentence_alignment = torch.nn.Linear(config.hidden_size, 2)
+        self.sentence_alignment = codedbertSentenceHead(config)
         self.cls = BertPreTrainingHeads(config)
         self.im_head = codedbertHead(config)
 
@@ -85,25 +99,24 @@ class codedbert(transformers.BertPreTrainedModel):
                             return_dict=True)
 
         sequence_output = outputs.last_hidden_state
-        pooler_output = outputs.pooler_output
-
+        pooler_output = outputs.pooler_output                 #[batch, 768]
+       
         # hidden states corresponding to the text part
-        text_output = sequence_output[:, :labels.shape[1], :]
+        text_output = sequence_output[:, :labels.shape[1], :] #[batch, 432, 768]
 
         # hidden states corresponding to the sentence part
-        sentence_output = sequence_output[:, labels.shape[1]:labels.shape[1]+16, :]
+        sentence_output = sequence_output[:, labels.shape[1]:labels.shape[1]+16, :] #[batch, 16, 768]
 
         # hidden states corresponding to the image part
-        image_output = sequence_output[:, labels.shape[1]+16:, :]
+        image_output = sequence_output[:, labels.shape[1]+16:, :] #[batch, 64, 768]
 
         # Predict the masked text tokens and alignment scores (whether image, text match)
-        prediction_scores, alignment_scores = self.cls(text_output, pooler_output)
+        prediction_scores, alignment_scores = self.cls(text_output, pooler_output) # aligment scores [batch, 2]
         im_scores = self.im_head(image_output)
 
         # Predict sentence alignemnt
-        sentence_alignment_pred = self.sentence_alignment(sentence_output)
-        pred_scores_sent_aligned = sentence_alignment_pred[is_paired.view(-1)]
-
+        sentence_alignment_pred = self.sentence_alignment(sentence_output).mean(1) # [batch, 16, 2] after mean [batch, 2]
+        
         # We only want to compute masked losses w.r.t. aligned samples
         pred_scores_aligned = prediction_scores[is_paired.view(-1)]
         labels_aligned = labels[is_paired.view(-1)]
@@ -133,7 +146,7 @@ class codedbert(transformers.BertPreTrainedModel):
         alignment_loss_text = loss_fct(alignment_scores.view(-1, 2), is_paired.long().view(-1))
 
         # Compute alignment loss for sentence
-        alignment_loss_sent = loss_fct(pred_scores_sent_aligned.view(-1, 2), is_paired.long().view(-1))
+        alignment_loss_sent = loss_fct(sentence_alignment_pred.view(-1, 2), is_paired.long().view(-1))
 
         return {
             "raw_outputs": outputs, 
@@ -144,6 +157,7 @@ class codedbert(transformers.BertPreTrainedModel):
             }
 
 def train(coded_bert, dataset, params, device, random_patches=False):
+    print('Random patches? ', random_patches)
     torch.manual_seed(0)
     train_size = int(len(dataset) * .8)
     test_size = len(dataset) - train_size
@@ -181,6 +195,7 @@ def train(coded_bert, dataset, params, device, random_patches=False):
             masked_patches = masked_patches.view(-1, patches.shape[2])
             im_mask = torch.rand((masked_patches.shape[0], 1)) >= 0.1
             masked_patches *= im_mask
+               
             try:
                 masked_patches = masked_patches.view(params.batch_size, im_seq_len, patches.shape[2])
             except Exception as e:
@@ -197,7 +212,8 @@ def train(coded_bert, dataset, params, device, random_patches=False):
 
             input_ids[token_mask >= 0.15] = -100
             input_ids[attention_mask == 0] = -100
-
+            
+            masked_patches = masked_patches.to(device)
             embeds = construct_bert_input(masked_patches, masked_input_ids, coded_bert, sentences=sents_embeds, device=device, random_patches=random_patches)
             # pad attention mask with 1s so model pays attention to the image parts
             attention_mask = F.pad(attention_mask, (0, embeds.shape[1] - input_ids.shape[1]), value = 1) # still works with sentences since we are using 1s for sent and imgs
@@ -236,7 +252,6 @@ class TrainParams:
     num_warmup_steps = 5000
     num_epochs = 10
     clip = 1.0
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train codedbert.')

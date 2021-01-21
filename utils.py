@@ -41,25 +41,27 @@ def construct_bert_input(patches, input_ids, coded_bert, sentences=None, device=
     # Get token type ids
     if sentences != None:
         # Token type
-        sentences_token_type_ids = torch.ones((sentences.shape[0], sentences.shape[1]), dtype=torch.long)
+        sentences_token_type_ids = torch.ones((sentences.shape[0], sentences.shape[1]), dtype=torch.long).to(device)
         sentences_token_type_embeds = coded_bert.bert.embeddings.token_type_embeddings(sentences_token_type_ids.to(device))
         # Position
-        sentences_position_ids = torch.arange(1, sentences.shape[1] + 1, dtype=torch.long).view(-1, 1) * torch.ones(sentences.shape[0], dtype=torch.long).T
+        sentences_position_ids = torch.arange(1, sentences.shape[1] + 1, dtype=torch.long).view(-1, 1).to(device) * torch.ones(sentences.shape[0], dtype=torch.long).to(device)
+        sentences_position_ids = sentences_position_ids.T
         sentences_position_embeds = coded_bert.bert.embeddings.position_embeddings(sentences_position_ids.to(device))
-        # Image token
-        image_token_type_ids = torch.ones((patches.shape[0], patches.shape[1]), dtype=torch.long) * 2
-    else:
-        image_token_type_ids = torch.ones((patches.shape[0], patches.shape[1]), dtype=torch.long)
-
+    
+    image_token_type_ids = torch.zeros((patches.shape[0], patches.shape[1]), dtype=torch.long)
+    
     if not random_patches:
-        image_position_embeds = coded_bert.bert.embeddings.position_embeddings(image_position_ids.to(device))
-    image_token_type_embeds = coded_bert.bert.embeddings.token_type_embeddings(image_token_type_ids.to(device))
-
-
+        image_position_embeds = coded_bert.im_position_embeddings(image_position_ids.to(device))
+        
+        #image_position_embeds = coded_bert.bert.embeddings.position_embeddings(image_position_ids.to(device))
+    #image_token_type_embeds = coded_bert.bert.embeddings.token_type_embeddings(image_token_type_ids.to(device))
+    image_token_type_embeds = coded_bert.im_type_em(image_token_type_ids.to(device))
+    
     # transforms patches into batch size, im sequence length, 768
     im_seq_len = patches.shape[1]
-    patches = patches.view(-1, patches.shape[2])
-    patches = coded_bert.im_to_embedding(patches.to(device))
+    patches = patches.view(-1, patches.shape[2]) # [256, 2048]
+  
+    patches = coded_bert.im_to_embedding(patches)
     # now shape batch size, im sequence length, 768
     patches = patches.view(word_embeddings.shape[0], im_seq_len, -1)
 
@@ -72,6 +74,8 @@ def construct_bert_input(patches, input_ids, coded_bert, sentences=None, device=
 
     # sentences
     if sentences != None:
+        #print('sentences: {}, sentences pos: {}, sentences token type: {}'.format(sentences.shape, sentences_position_embeds.shape, sentences_token_type_embeds.shape))
+        sentences = sentences.to(device)
         sentences_embeddings = sentences + sentences_position_embeds + sentences_token_type_embeds
         return torch.cat((word_embeddings, sentences_embeddings, image_embeddings), dim=1)
 
