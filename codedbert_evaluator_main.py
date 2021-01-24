@@ -15,6 +15,14 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
+class codedbertSentenceHead(torch.nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.sent_cls = torch.nn.Linear(config.hidden_size, 2)
+
+    def forward(self, sent_output):
+        return self.sent_cls(sent_output)
+
 class codedbertEvaluator(transformers.BertPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -24,8 +32,11 @@ class codedbertEvaluator(transformers.BertPreTrainedModel):
         self.im_to_embedding = torch.nn.Linear(2048, 768)
         self.im_to_embedding_norm = torch.nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
-        self.cls = BertPreTrainingHeads(config)
+        self.im_type_em = torch.nn.Embedding(1, config.hidden_size)
+        self.im_position_embeddings = torch.nn.Embedding(config.max_position_embeddings, config.hidden_size)
 
+        self.cls = BertPreTrainingHeads(config)
+        self.sentence_alignment = codedbertSentenceHead(config)
         self.init_weights()
 
     def text2img_scores(self,
@@ -62,6 +73,7 @@ class codedbertEvaluator(transformers.BertPreTrainedModel):
         score_pos_dict = {'text': input_ids,
                           'score': score_p,
                           'label': True}
+
         query_dict_scores.append(score_pos_dict)
         query_scores.append(score_p)
         query_labels.append(True)
@@ -198,9 +210,13 @@ class codedbertEvaluator(transformers.BertPreTrainedModel):
         pooler_output = outputs.pooler_output  # [batch_size, hidden_size] last layer of hidden-state of first token (CLS) + linear layer + tanh
 
         # hidden states corresponding to the text part
-        text_output = sequence_output[:, :labels.shape[1], :]  # [batch, 448, 768]
+        text_output = sequence_output[:, :labels.shape[1], :]  # [batch, 432, 768]
+
+        # hidden states corresponding to the sentence part
+        sentence_output = sequence_output[:, labels.shape[1]:labels.shape[1] + 16, :]  # [batch, 16, 768]
+
         # hidden states corresponding to the image part
-        image_output = sequence_output[:, labels.shape[1]:, :]  # [batch, 64, 768]
+        image_output = sequence_output[:, labels.shape[1] + 16:, :]  # [batch, 64, 768]
 
         ### FOR TEXT
         # Predict the masked text tokens and alignment scores (whether image and text match)
@@ -208,8 +224,11 @@ class codedbertEvaluator(transformers.BertPreTrainedModel):
         # prediction score is [batch, 448, vocab_size = 30522]
         # aligment score is [batch, 2] 2 with logits corresponding to 1 and  0
 
+        # Predict sentence alignemnt
+        sentence_alignment_scores = self.sentence_alignment(sentence_output).mean(1) #[batch, 16, 2] after mean [batch, 2]
+
         if only_alignment:
-            return alignment_scores, is_paired
+            return alignment_scores, sentence_alignment_scores, is_paired
 
         text_evaluator = {'text_pred_logits': prediction_scores,
                           'text_labels': labels}
@@ -217,10 +236,13 @@ class codedbertEvaluator(transformers.BertPreTrainedModel):
         alignment_evaluator = {'alignment_logits': alignment_scores,
                                'alignment_labels': is_paired}
 
-        text_acc, alig_acc = self.accuracy_scores(text_evaluator, alignment_evaluator)
-        return text_acc, alig_acc
+        sent_alignment_evaluator = {'alignment_logits': alignment_scores,
+                               'alignment_labels': is_paired}
 
-    def accuracy_scores(self, text_evaluator, alignment_evaluator):
+        text_acc, alig_acc, sent_alig_acc = self.accuracy_scores(text_evaluator, alignment_evaluator, sent_alignment_evaluator)
+        return text_acc, alig_acc, sent_alig_acc
+
+    def accuracy_scores(self, text_evaluator, alignment_evaluator, sent_alignment_evaluator):
         """
         Text evaluator:  dictionary with preds and labels (aligned)
         Image evaluator: dictionary with image output and image patches (aligned)
@@ -242,14 +264,25 @@ class codedbertEvaluator(transformers.BertPreTrainedModel):
         # alig_labels = alig_labels.double().cpu().numpy().flatten()
         alig_preds = np.argmax(alig_pred_logits, axis=1).flatten()  # [1, 2]
 
+        # Sentence Alignment
+        sent_alig_pred_logits = sent_alignment_evaluator['alignment_logits']  # [1, 2]
+        sent_alig_labels = sent_alignment_evaluator['alignment_labels']  # [2]
+
+        sent_alig_pred_logits = sent_alig_pred_logits.detach().cpu().numpy()
+        sent_alig_labels = np.asarray([sent_alig_labels])
+        # alig_labels = alig_labels.double().cpu().numpy().flatten()
+        sent_alig_preds = np.argmax(sent_alig_pred_logits, axis=1).flatten()  # [1, 2]
+
+
         text_acc = accuracy_score(text_labels, text_preds)
         alig_acc = accuracy_score(alig_labels, alig_preds)
+        sent_alig_acc = accuracy_score(sent_alig_labels, sent_alig_preds)
 
-        return text_acc, alig_acc
+        return text_acc, alig_acc, sent_alig_acc
 
 
 def image2text(patches, neg_patches, input_ids, is_paired, attention_mask, neg_input_ids, neg_attention_mask,
-               evaluator, random_patches):
+               sents_embeds, evaluator, random_patches):
     """
     image2text retrieval:
         Query = Image
@@ -259,7 +292,7 @@ def image2text(patches, neg_patches, input_ids, is_paired, attention_mask, neg_i
     bs = input_ids.shape[0]
     len_neg_inputs = neg_input_ids.shape[1]
 
-    embeds = construct_bert_input(patches, input_ids, evaluator, device=device, random_patches=random_patches)
+    embeds = construct_bert_input(patches, input_ids, evaluator, sentences=sents_embeds, device=device, random_patches=random_patches)
     attention_mask_mm = F.pad(attention_mask, (0, embeds.shape[1] - input_ids.shape[1]), value=1)
 
     # NEGATIVE SAMPLE # [batch, 100, 448]
@@ -271,7 +304,7 @@ def image2text(patches, neg_patches, input_ids, is_paired, attention_mask, neg_i
         neg_input_id_sample = neg_input_ids[:, j, :]  # [1, 448]
         neg_attention_mask_sample = neg_attention_mask[:, j, :]
 
-        embeds_neg = construct_bert_input(patches, neg_input_id_sample, evaluator, device=device, random_patches=random_patches)
+        embeds_neg = construct_bert_input(patches, neg_input_id_sample, evaluator, sentences=sents_embeds, device=device, random_patches=random_patches)
         attention_mask_neg = F.pad(neg_attention_mask_sample, (0, embeds_neg.shape[1] - neg_input_id_sample.shape[1]),
                                    value=1)
 
@@ -289,7 +322,7 @@ def image2text(patches, neg_patches, input_ids, is_paired, attention_mask, neg_i
         att_mask_n=all_att_mask)
 
     # Accuracy: only in positive example
-    txt_acc, alig_acc = evaluator.get_scores_and_metrics(
+    txt_acc, alig_acc, sent_alig_acc = evaluator.get_scores_and_metrics(
         embeds,  # text + image embedded
         attention_mask_mm,
         labels=input_ids,  # [batch, 448]
@@ -297,11 +330,11 @@ def image2text(patches, neg_patches, input_ids, is_paired, attention_mask, neg_i
         only_alignment=False,
     )
 
-    return all_scores_query, txt_acc, alig_acc
+    return all_scores_query, txt_acc, alig_acc, sent_alig_acc
 
 
 def text2image(patches, neg_patches, input_ids, is_paired, attention_mask, neg_input_ids, neg_attention_mask,
-               evaluator, random_patches):
+               sents_embeds, evaluator, random_patches):
     """
     text2image retrieval:
         Query = Text
@@ -313,7 +346,7 @@ def text2image(patches, neg_patches, input_ids, is_paired, attention_mask, neg_i
 
     # before constructing bert, att mask is 448 long
     # POSITIVE IMAGE
-    embeds = construct_bert_input(patches, input_ids, evaluator, device=device, random_patches=random_patches)
+    embeds = construct_bert_input(patches, input_ids, evaluator, sentences=sents_embeds, device=device, random_patches=random_patches)
     attention_mask_mm = F.pad(attention_mask, (0, embeds.shape[1] - input_ids.shape[1]), value=1)  # [1, 512]
 
     # NEGATIVE SAMPLES
@@ -322,7 +355,7 @@ def text2image(patches, neg_patches, input_ids, is_paired, attention_mask, neg_i
 
     for p in range(len_neg_inputs):
         neg_patches_sample = neg_patches[:, p, :, :]
-        embeds_neg = construct_bert_input(neg_patches_sample, input_ids, evaluator, device=device, random_patches=random_patches)
+        embeds_neg = construct_bert_input(neg_patches_sample, input_ids, evaluator, sentences=sents_embeds, device=device, random_patches=random_patches)
         attention_mask_neg = F.pad(attention_mask, (0, embeds_neg.shape[1] - input_ids.shape[1]), value=1)
 
         all_embeds_neg.append(embeds_neg)
@@ -337,7 +370,7 @@ def text2image(patches, neg_patches, input_ids, is_paired, attention_mask, neg_i
         att_mask_n=all_att_mask)  # list
 
     # Accuracy: only in positive example
-    txt_acc, alig_acc = evaluator.get_scores_and_metrics(
+    txt_acc, alig_acc, sent_alig_acc = evaluator.get_scores_and_metrics(
         embeds,  # text + image embedded
         attention_mask_mm,  # [batch,
         labels=input_ids,  # [batch, 448]
@@ -345,7 +378,7 @@ def text2image(patches, neg_patches, input_ids, is_paired, attention_mask, neg_i
         only_alignment=False,
     )
 
-    return all_scores_query, txt_acc, alig_acc
+    return all_scores_query, txt_acc, alig_acc, sent_alig_acc
 
 
 def test(dataset, device, save_file_name, pretrained_model=None, random_patches=False):
@@ -369,12 +402,15 @@ def test(dataset, device, save_file_name, pretrained_model=None, random_patches=
     query_dict_txt2im = {}
     running_acc_alignment_im2txt = 0.0
     running_acc_pred_im2txt = 0.0
+    running_acc_sent_alig_im2txt = 0.0
+
     running_acc_alignment_txt2im = 0.0
     running_acc_pred_txt2im = 0.0
+    running_acc_sent_alig_txt2im = 0.0
 
     with torch.no_grad():
         for i, (
-        patches, neg_patches, input_ids, attention_mask, neg_input_ids, neg_attention_mask, img_name) in enumerate(
+        patches, neg_patches, input_ids, attention_mask, neg_input_ids, neg_attention_mask, sents_embeds, img_name) in enumerate(
                 tqdm(dataloader)):
             # ****** Shapes ********
             # input_ids shape:     [1, 448]
@@ -382,12 +418,11 @@ def test(dataset, device, save_file_name, pretrained_model=None, random_patches=
             # neg_patches:         [1, NUM_SAMPLES=100, 64, 2048]
 
             # IMAGE 2 TEXT
-
             is_paired = 1.
             # print('im2text..')
-            im2txt_query_scores, im2txt_pred_acc, im2txt_alig_acc = image2text(patches, neg_patches, input_ids,
+            im2txt_query_scores, im2txt_pred_acc, im2txt_alig_acc, im2txt_sent_alig_acc= image2text(patches, neg_patches, input_ids,
                                                                                is_paired, attention_mask,
-                                                                               neg_input_ids, neg_attention_mask,
+                                                                               neg_input_ids, neg_attention_mask, sents_embeds,
                                                                                evaluator, random_patches)
 
             # print('done')
@@ -395,15 +430,16 @@ def test(dataset, device, save_file_name, pretrained_model=None, random_patches=
             # Accuracies
             running_acc_pred_im2txt += im2txt_pred_acc
             running_acc_alignment_im2txt += im2txt_alig_acc
+            running_acc_sent_alig_im2txt += im2txt_sent_alig_acc
 
             # For Rank @ K
             query_dict_im2txt[img_name[0]] = im2txt_query_scores
 
             # TEXT 2 IMAGE
             # print('txt2img..')
-            txt2im_query_scores, txt2im_pred_acc, txt2im_alig_acc = text2image(patches, neg_patches, input_ids,
+            txt2im_query_scores, txt2im_pred_acc, txt2im_alig_acc, txt2im_sent_alig_acc = text2image(patches, neg_patches, input_ids,
                                                                                is_paired, attention_mask,
-                                                                               neg_input_ids, neg_attention_mask,
+                                                                               neg_input_ids, neg_attention_mask, sents_embeds,
                                                                                evaluator, random_patches)
 
             # print('done')
@@ -411,14 +447,18 @@ def test(dataset, device, save_file_name, pretrained_model=None, random_patches=
             # Accuracies
             running_acc_pred_txt2im += txt2im_pred_acc
             running_acc_alignment_txt2im += txt2im_alig_acc
+            running_acc_sent_alig_text2im += txt2im_sent_alig_acc
 
             # For Rank @ K
             query_dict_txt2im[img_name[0]] = txt2im_query_scores
 
     im2txt_test_set_accuracy_pred = (running_acc_pred_im2txt / len(dataloader))
     im2txt_test_set_accuracy_alig = (running_acc_alignment_im2txt / len(dataloader))
+    im2txt_test_set_sent_accuracy_alig = (running_acc_sent_alig_im2txt / len(dataloader))
+
     txt2im_test_set_accuracy_pred = (running_acc_pred_txt2im / len(dataloader))
     txt2im_test_set_accuracy_alig = (running_acc_alignment_txt2im / len(dataloader))
+    txt2im_test_set_sent_accuracy_alig = (running_acc_sent_alig_txt2im / len(dataloader))
 
     print()
     results = ''
@@ -426,28 +466,36 @@ def test(dataset, device, save_file_name, pretrained_model=None, random_patches=
     log2 = evaluator.rank_at_K(query_dict_im2txt, True)
     log3 = '---- Accuracy in token predictions: {} -----\n'.format(im2txt_test_set_accuracy_pred)
     log4 = '---- Accuracy in text-image alignment: {} -----\n'.format(im2txt_test_set_accuracy_alig)
+    log41 = '---- Accuracy in text-image sentence alignment: {} -----\n'.format(im2txt_test_set_sent_accuracy_alig)
     print(log1)
     print(log2)
     print(log3)
     print(log4)
+    print(log41)
     print()
+
     log5 = '---- TEXT 2 IMAGE EVALUATIONS ---------------------\n'
     log6 = evaluator.rank_at_K(query_dict_txt2im, False)
     log7 = '---- Accuracy in token predictions: {} -----\n'.format(txt2im_test_set_accuracy_pred)
     log8 = '---- Accuracy in text-image alignment: {} -----\n'.format(txt2im_test_set_accuracy_alig)
+    log81 = '---- Accuracy in text-image sentence alignment: {} -----\n'.format(txt2im_test_set_sent_accuracy_alig)
     print(log5)
     print(log6)
     print(log7)
     print(log8)
+    print(log81)
 
     results += log1
     results += log2
     results += log3
     results += log4
+    results += log41
+
     results += log5
     results += log6
     results += log7
     results += log8
+    results += log81
 
     save_json(save_file_name, results)
 

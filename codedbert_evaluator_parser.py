@@ -16,6 +16,8 @@ class Evaluation_negpairs(Dataset):
         self.att_masks = self.dataset['attention_masks']
         self.images = self.dataset['img_names']
         self.patch_positions = self.dataset['patch_positions']
+        # Addition for sentences
+        self.sentences = self.dataset['sents_embeds']
 
     def __len__(self):
         return len(self.input_ids)
@@ -29,6 +31,8 @@ class Evaluation_negpairs(Dataset):
         att_masks = self.att_masks[idx]  # [448]
         im_name = self.images[idx]
         patch_pos = self.patch_positions[idx]
+        # Addition for sentences
+        sent = self.sentences[idx]
 
         # Generate 100 random indices
         negative_indices = random.sample(range(0, len(self.images)), 100)
@@ -51,6 +55,7 @@ class Evaluation_negpairs(Dataset):
             att_masks.clone().detach(),  # [448]
             neg_input_ids.clone().detach(),  # [100, 448]
             neg_att_masks.clone().detach(),  # [100, 448]
+            sent.clone().detach(),
             im_name
         )
 
@@ -74,10 +79,11 @@ def get_all_paired_test_set(dataset, savefile_path, num_samples=1000):
     all_masks = []
     all_im_names = []
     all_patch_positions = []
+    all_sentences = []
 
     paired = 0
     with torch.no_grad():
-        for i, (patches, input_ids, is_paired, attention_mask, img_name, patch_positions) in enumerate(dataloader):
+        for i, (patches, input_ids, is_paired, attention_mask, img_name, patch_positions, sents) in enumerate(dataloader):
             if paired >= num_samples:
                 print('Paired: ', paired)
                 break
@@ -93,6 +99,7 @@ def get_all_paired_test_set(dataset, savefile_path, num_samples=1000):
             aligned_patches = patches[is_paired]
             aligned_att_mask = attention_mask[is_paired]
             aligned_patch_pos = patch_positions[is_paired]
+            aligned_sents = sents[is_paired]
 
             num_paired = aligned_ids.shape[0]
 
@@ -103,6 +110,7 @@ def get_all_paired_test_set(dataset, savefile_path, num_samples=1000):
                 all_masks.append(aligned_att_mask)
                 all_im_names.extend(aligned_imgs)
                 all_patch_positions.append(aligned_patch_pos)
+                all_sentences.append(aligned_sents)
                 #aligned_test_set.append((aligned_patches, aligned_ids, aligned_att_mask, aligned_imgs, aligned_patch_pos))
 
             else: continue
@@ -113,19 +121,22 @@ def get_all_paired_test_set(dataset, savefile_path, num_samples=1000):
     IDS = torch.cat(all_ids, dim=0)
     MASKS = torch.cat(all_masks, dim=0)
     PATCH_POS = torch.cat(all_patch_positions, dim=0)
+    SENTS = torch.cat(all_sentences, dim=0)
 
     PATCHES = PATCHES[:1000, ]
     IDS = IDS[:1000, ]
     MASKS = MASKS[:1000, ]
     PATCH_POS = PATCH_POS[:1000, ]
     IMGS = all_im_names[:1000]
+    SENTS = SENTS[:1000,]
     print('Saving test set...')
 
     D = {'patches': PATCHES,
          'input_ids': IDS,
          'attention_masks': MASKS,
          'img_names':IMGS,
-         'patch_positions':PATCH_POS}
+         'patch_positions':PATCH_POS,
+         'sents_embeds':SENTS}
 
     print('Length paired test set: ', PATCHES.shape[0])
     with open(savefile_path, 'wb') as handle:

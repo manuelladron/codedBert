@@ -81,7 +81,6 @@ def construct_bert_input(patches, input_ids, coded_bert, sentences=None, device=
 
     return torch.cat((word_embeddings, image_embeddings), dim=1)
 
-
 class EncoderCNN(torch.nn.Module):
     def __init__(self):
         """Load the pretrained ResNet50 and replace top fc layer."""
@@ -122,8 +121,7 @@ class Encoder_mCNN_resnet(torch.nn.Module):
         with torch.no_grad():
             features = self.resnet_(images)
         return features
-    
-    
+
 class MultiModalBertDataset(Dataset):
     """
     Added sentence embeddings
@@ -246,7 +244,6 @@ class MultiModalBertDataset(Dataset):
     
         return processed_patches, tokens['input_ids'][0], torch.tensor(is_paired), tokens['attention_mask'][0], image_name, torch.tensor(patch_positions, dtype=torch.long), sent_embeddings
 
-
 class PreprocessedADARI(Dataset):
     def __init__(self, path_to_dataset):
         super(PreprocessedADARI).__init__()
@@ -295,7 +292,9 @@ class EvaluationDataset(Dataset):
             torch.tensor(sample.is_paired),
             torch.tensor(sample.attention_mask),
             sample.img_name,
-            torch.tensor(sample.patch_positions)
+            torch.tensor(sample.patch_positions),
+            # New addition for sentences
+            torch.tensor(sample.sents_embeds),
         )
 
 class codedbertRandomPatchesDataset(Dataset):
@@ -376,7 +375,6 @@ class codedbertRandomPatchesDataset(Dataset):
     
         return processed_patches, tokens['input_ids'][0], torch.tensor(is_paired), tokens['attention_mask'][0], image_name, torch.tensor(patch_positions, dtype=torch.long)
 
-
 def mask_input_ids(
     input_ids, 
     pos, 
@@ -441,7 +439,6 @@ def test():
     attention_mask = torch.ones(input_ids.shape)
     
     return mask_input_ids(input_ids, pos, adj_value, adj_mask_prob, adj_value, attention_mask)
-
 
 class Pos:
     POS_MAP  = ['UNK', 'ADJ', 'ADP', 'ADV', 'AUX', 'CONJ', 'CCONJ', 'DET', 'INTJ', 'NOUN', 'NUM', 'PART', 
