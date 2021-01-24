@@ -416,7 +416,10 @@ def test(dataset, device, save_file_name, pretrained_model=None, random_patches=
             # input_ids shape:     [1, 448]
             # neg_input_ids shape: [1, NUM_SAMPLES=100, 448]
             # neg_patches:         [1, NUM_SAMPLES=100, 64, 2048]
-
+            
+            patches = patches.to(device)
+            neg_patches = neg_patches.to(device)
+            sents_embeds = sents_embeds.to(device)
             # IMAGE 2 TEXT
             is_paired = 1.
             # print('im2text..')
@@ -447,7 +450,7 @@ def test(dataset, device, save_file_name, pretrained_model=None, random_patches=
             # Accuracies
             running_acc_pred_txt2im += txt2im_pred_acc
             running_acc_alignment_txt2im += txt2im_alig_acc
-            running_acc_sent_alig_text2im += txt2im_sent_alig_acc
+            running_acc_sent_alig_txt2im += txt2im_sent_alig_acc
 
             # For Rank @ K
             query_dict_txt2im[img_name[0]] = txt2im_query_scores
@@ -502,7 +505,7 @@ def test(dataset, device, save_file_name, pretrained_model=None, random_patches=
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Evaluate codedbert')
-    parser.add_argument('--path_to_train_dataset', help='Absolute path to .pkl file used for training')
+#     parser.add_argument('--path_to_train_dataset', help='Absolute path to .pkl file used for training')
     parser.add_argument('--path_to_pretrained_model', help='Path to pretrained model', default=None)
     parser.add_argument('--save_test_set', help='Name to save test set .pkl', default='test_set.pkl')
     parser.add_argument('--save_results_name', help='Name to save file with results', default='results.json')
@@ -510,12 +513,12 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # 1) Builds the 1000 sample dataset.  This corresponds to the fashionibert_evaluator_parser file
-    print('Processing the dataset...')
-    dataset = EvaluationDataset(args.path_to_train_dataset)
+#     print('Processing the dataset...')
+#     dataset = EvaluationDataset(args.path_to_train_dataset)
     # savefile_path = '../../../__codedbert_trained/codedbert_vanilla_adaptive/evaluation_set_codedbert_vanilla.pkl'
-    print('Done!')
-    print('\nGetting aligned pairs...')
-    get_all_paired_test_set(dataset, args.save_test_set, num_samples=1000)
+#     print('Done!')
+#     print('\nGetting aligned pairs...')
+#     get_all_paired_test_set(dataset, args.save_test_set, num_samples=1000)
     # print('Done!')
 
     # 2) Evaluate-

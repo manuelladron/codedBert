@@ -1,6 +1,7 @@
 import torch, torchvision
 from torch.utils.data import Dataset, DataLoader
-from pickle5 import pickle
+# from pickle5 import pickle
+import pickle
 import numpy as np
 import random
 from utils import EvaluationDataset
